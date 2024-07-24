@@ -1,0 +1,171 @@
+services:
+  localstack:
+    image: localstack/localstack
+    container_name: localstack
+    ports:
+      - "127.0.0.1:4566:4566"              # LocalStack Gateway
+      - "127.0.0.1:4510-4559:4510-4559"  # external services port range
+    environment:
+      SERVICES: ${SERVICES}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      DOCKER_HOST: unix:///var/run/docker.sock
+      AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT}
+      HOSTNAME: localstack
+      HOSTNAME_EXTERNAL: localstack
+    volumes:
+      - localstack:/var/lib/localstack
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+      ## exec aws --endpoint-url=http://localstack:4566  s3 mb s3:://mlflow or awslocal s3api create-bucket --bucket sample-bucket and awslocal s3api list-buckets
+      # exec aws --endpoint-url=http://localstack:4566  s3 mb s3:://data
+      ## put file
+  #     awslocal s3api put-object --bucket data --key diamonds.csv --body input/diamonds/diamonds.csv 
+    networks:
+      - ml-network
+  mlflow:
+    image: ghcr.io/mlflow/mlflow
+    container_name: mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      MLFLOW_SERVER_DEFAULT_ARTIFACT_ROOT: s3://${MLFLOW_BUCKET}
+      MLFLOW_SERVER_HOST: ${MLFLOW_SERVER_HOST}
+      MLFLOW_SERVER_PORT: ${MLFLOW_SERVER_PORT}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
+    ports:
+      - 5001:${MLFLOW_SERVER_PORT}
+    networks:
+      - ml-network
+    depends_on:
+      - localstack
+      - mlflow_db
+    entrypoint: >
+      /bin/sh -c "
+      pip install pymysql boto3 PyMySQL[rsa] && \
+      mlflow server \
+      --backend-store-uri  mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mlflow_db:3306/${MYSQL_DATABASE} \
+      --default-artifact-root s3://${MLFLOW_BUCKET} \
+      --host ${MLFLOW_SERVER_HOST}
+      "
+  mlflow_db:
+    restart: always
+    image: mysql/mysql-server:8.0.32
+    container_name: mlflow_db
+    ports:
+      - 3307:3306
+    expose:
+      - 3307
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mlflow_db_volume:/var/lib/mysql
+    networks:
+      - ml-network
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: pma
+    links:
+      - mlflow_db
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_ARBITRARY: 1
+    restart: always
+    ports:
+      - "8081:80"
+    networks:
+      - ml-network
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: app
+    restart: always
+    ports:
+      - 8000:8000
+    networks:
+      - ml-network
+    depends_on:
+      - mlflow
+    environment:
+      MLFLOW_SERVER_HOST: ${MLFLOW_SERVER_HOST}
+      MLFLOW_SERVER_PORT: 5001
+      MLFLOW_S3_ENDPOINT_URL: ${AWS_S3_ENDPOINT}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      MLFLOW_BUCKET: ${MLFLOW_BUCKET}
+      DATA_BUCKET: ${DATA_BUCKET}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - ./app:/app
+  prefect_server:
+    container_name: prefect-server
+    image: prefecthq/prefect:2.11.5-python3.11
+    restart: always
+    entrypoint: ["prefect", "server", "start"]
+    environment:
+      PREFECT_UI_URL: http://127.0.0.1:4200/api
+      PREFECT_API_URL: http://127.0.0.1:4200/api
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+    ports:
+      - 4200:4200
+    networks:
+      - ml-network
+  agent:
+    container_name: agent
+    build: ./train
+    restart: always
+    entrypoint: ["prefect", "agent", "start", "-q", "default"]
+    environment:
+      PREFECT_API_URL: http://prefect_server:4200/api
+    depends_on:
+      prefect_server:
+        condition: service_started
+      mlflow:
+        condition: service_started
+    working_dir: "/root/training"
+    volumes:
+      - ./train:/root/training
+    networks:
+      - ml-network
+  prefect_deploy:
+    container_name: prefect-deploy
+    build: ./train
+    restart: on-failure
+    environment:
+      - PREFECT_API_URL=http://prefect_server:4200/api
+      - PYTHONUNBUFFERED=True
+    depends_on:
+      mlflow:
+        condition: service_started
+      agent:
+        condition: service_started
+      prefect_server:
+        condition: service_started
+    working_dir: "/root/training"
+    volumes:
+      - ./train:/root/training
+    networks:
+      - ml-network
+volumes:
+  cache:
+    driver: local
+  mlflow_db_volume:
+    driver: local
+  localstack:
+    driver: local
+networks:
+  ml-network:
+    driver: bridge
